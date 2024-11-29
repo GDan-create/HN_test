@@ -1,7 +1,6 @@
 function createUnityInstance(canvas, config, onProgress) {
   onProgress = onProgress || function () {};
 
-
   function showBanner(msg, type) {
     // Only ever show one error at most - other banner messages after that should get ignored
     // to avoid noise.
@@ -55,6 +54,7 @@ function createUnityInstance(canvas, config, onProgress) {
       preserveDrawingBuffer: false,
       powerPreference: 2,
     },
+    wasmFileSize: 109259036,
     cacheControl: function (url) {
       return (url == Module.dataUrl || url.match(/\.bundle/)) ? "must-revalidate" : "no-store";
     },
@@ -97,11 +97,11 @@ function createUnityInstance(canvas, config, onProgress) {
     ],
   };
 
-  // Add fallback values for companyName, productName and productVersion to ensure that the UnityCache is working. 
+  // Add fallback values for companyName, productName and productVersion to ensure that the UnityCache is working.
   fallbackToDefaultConfigWithWarning(config, "companyName", "Unity");
   fallbackToDefaultConfigWithWarning(config, "productName", "WebGL Player");
   fallbackToDefaultConfigWithWarning(config, "productVersion", "1.0");
-  
+
   for (var parameter in config)
     Module[parameter] = config[parameter];
 
@@ -200,15 +200,38 @@ function createUnityInstance(canvas, config, onProgress) {
         Module.onQuit = resolve;
       });
     },
-    GetMemoryInfo: function () {
-      var memInfoPtr = Module._getMemInfo();
+    GetMetricsInfo: function () {
+      var metricsInfoPtr = Number(Module._getMetricsInfo()) >>> 0;
+      // pointer arithmetic to then index into the WASM heap, we go up by 4 bytes for Uint32 or 8 bytes for doubles.
+      var totalWASMHeapSizePtr = metricsInfoPtr;
+      var usedWASMHeapSizePtr = totalWASMHeapSizePtr + 4; // + 4 because totalWasHeapSize is size_t (4 bytes/ 32-bit unsigned int)
+      var totalJSHeapSizePtr = usedWASMHeapSizePtr + 4; // same reason
+      var usedJSHeapSizePtr = totalJSHeapSizePtr + 8; // + 8 because totalJSHeapSize is a double (8 bytes).. and so on
+      var pageLoadTimePtr = usedJSHeapSizePtr + 8;
+      var pageLoadTimeToFrame1Ptr = pageLoadTimePtr + 4;
+      var fpsPtr = pageLoadTimeToFrame1Ptr + 4;
+      var movingAverageFpsPtr = fpsPtr + 8;
+      var assetLoadTimePtr = movingAverageFpsPtr + 8;
+      var webAssemblyStartupTimePtr = assetLoadTimePtr + 4;
+      var codeDownloadTimePtr = webAssemblyStartupTimePtr + 4;
+      var gameStartupTimePtr = codeDownloadTimePtr + 4;
+      var numJankedFramesPtr = gameStartupTimePtr + 4;
       return {
-        totalWASMHeapSize: Module.HEAPU32[memInfoPtr >> 2],
-        usedWASMHeapSize: Module.HEAPU32[(memInfoPtr >> 2) + 1],
-        totalJSHeapSize: Module.HEAPF64[(memInfoPtr >> 3) + 1],
-        usedJSHeapSize: Module.HEAPF64[(memInfoPtr >> 3) + 2]
+        totalWASMHeapSize: Module.HEAPU32[totalWASMHeapSizePtr >> 2],
+        usedWASMHeapSize: Module.HEAPU32[usedWASMHeapSizePtr >> 2],
+        totalJSHeapSize: Module.HEAPF64[totalJSHeapSizePtr >> 3],
+        usedJSHeapSize: Module.HEAPF64[usedJSHeapSizePtr >> 3],
+        pageLoadTime: Module.HEAPU32[pageLoadTimePtr >> 2],
+        pageLoadTimeToFrame1: Module.HEAPU32[pageLoadTimeToFrame1Ptr >> 2],
+        fps: Module.HEAPF64[fpsPtr >> 3],
+        movingAverageFps: Module.HEAPF64[movingAverageFpsPtr >> 3],
+        assetLoadTime: Module.HEAPU32[assetLoadTimePtr >> 2],
+        webAssemblyStartupTime: Module.HEAPU32[webAssemblyStartupTimePtr >> 2] - (Module.webAssemblyTimeStart || 0),
+        codeDownloadTime: Module.HEAPU32[codeDownloadTimePtr >> 2],
+        gameStartupTime: Module.HEAPU32[gameStartupTimePtr >> 2],
+        numJankedFrames: Module.HEAPU32[numJankedFramesPtr >> 2]
       };
-    },
+    }
   };
 
 
@@ -277,7 +300,7 @@ function createUnityInstance(canvas, config, onProgress) {
     osVersion = versionMappings[osVersion] || osVersion;
 
     // TODO: Add mobile device identifier, e.g. SM-G960U
-
+    webgpuVersion = 0;
     canvas = document.createElement("canvas");
     if (canvas) {
       var gl = canvas.getContext("webgl2");
@@ -289,10 +312,28 @@ function createUnityInstance(canvas, config, onProgress) {
       if (gl) {
         gpu = (gl.getExtension("WEBGL_debug_renderer_info") && gl.getParameter(0x9246 /*debugRendererInfo.UNMASKED_RENDERER_WEBGL*/)) || gl.getParameter(0x1F01 /*gl.RENDERER*/);
       }
+
+    }
+
+    // Returns true on success, and a string on failure that denotes which sub-feature was missing.
+    function testWasm2023Supported() {
+      try {
+        if (!window.WebAssembly) return 'WebAssembly';
+        if (!WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,5,3,1,0,1,10,13,1,11,0,65,0,65,0,65,1,252,11,0,11]))) return 'bulk-memory';
+        if (!WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,11,1,9,1,1,125,32,0,252,0,26,11]))) return 'non-trapping fp-to-int';
+        if (!WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,10,1,8,1,1,126,32,0,194,26,11]))) return 'sign-extend';
+        if (!WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,9,1,7,0,65,0,253,15,26,11]))) return 'wasm-simd128';
+        if (!WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,10,1,8,0,6,64,1,25,1,11,11]))) return 'wasm-exceptions';
+        return true;
+      } catch(e) {
+        return 'Exception: ' + e;
+      }
     }
 
     var hasThreads = typeof SharedArrayBuffer !== 'undefined';
     var hasWasm = typeof WebAssembly === "object" && typeof WebAssembly.compile === "function";
+    var hasWasm2023 = hasWasm && testWasm2023Supported() === true;
+
     return {
       width: screen.width,
       height: screen.height,
@@ -305,10 +346,13 @@ function createUnityInstance(canvas, config, onProgress) {
       gpu: gpu || 'Unknown GPU',
       language: navigator.userLanguage || navigator.language,
       hasWebGL: glVersion,
+      hasWebGPU: webgpuVersion,
       hasCursorLock: !!document.body.requestPointerLock,
       hasFullscreen: !!document.body.requestFullscreen || !!document.body.webkitRequestFullscreen, // Safari still uses the webkit prefixed version
       hasThreads: hasThreads,
       hasWasm: hasWasm,
+      hasWasm2023: hasWasm2023,
+      missingWasm2023Feature: hasWasm2023 ? null : testWasm2023Supported(),
       // This should be updated when we re-enable wasm threads. Previously it checked for WASM thread
       // support with: var wasmMemory = hasWasm && hasThreads && new WebAssembly.Memory({"initial": 1, "maximum": 1, "shared": true});
       // which caused Chrome to have a warning that SharedArrayBuffer requires cross origin isolation.
@@ -1029,9 +1073,9 @@ Module.UnityCache = function () {
           cache.revalidated = true;
 
           unityCache.updateRequestMetaData(cache.metaData).then(function () {
-            log("'" + cache.metaData.url + "' successfully revalidated and served from the indexedDB cache");
+            log("'" + cache.metaData.url + "' successfully revalidated and served from the browser cache");
           }).catch(function (error) {
-            log("'" + cache.metaData.url + "' successfully revalidated but not stored in the indexedDB cache due to the error: " + error);
+            log("'" + cache.metaData.url + "' successfully revalidated but not stored in the browser cache due to the error: " + error);
           });
 
           return readBodyWithProgress(cache.response, init.onProgress, init.enableStreamingDownload);
@@ -1049,9 +1093,9 @@ Module.UnityCache = function () {
               unityCache.storeRequest(resource, clonedResponse),
               unityCache.updateRequestMetaData(cache.metaData)
             ]).then(function () {
-              log("'" + url + "' successfully downloaded and stored in the indexedDB cache");
+              log("'" + url + "' successfully downloaded and stored in the browser cache");
             }).catch(function (error) {
-              log("'" + url + "' successfully downloaded but not stored in the indexedDB cache due to the error: " + error);
+              log("'" + url + "' successfully downloaded but not stored in the browser cache due to the error: " + error);
             });
 
             return response;
@@ -1085,7 +1129,7 @@ Module.UnityCache = function () {
       if (cache.control == "immutable") {
         cache.revalidated = true;
         unityCache.updateRequestMetaData(metaData).then(function () {
-          log("'" + cache.metaData.url + "' served from the indexedDB cache without revalidation");
+          log("'" + cache.metaData.url + "' served from the browser cache without revalidation");
         });
 
         return readBodyWithProgress(response, init.onProgress, init.enableStreamingDownload);
@@ -1096,7 +1140,7 @@ Module.UnityCache = function () {
           });
           if (cache.revalidated) {
             unityCache.updateRequestMetaData(metaData).then(function () {
-              log("'" + cache.metaData.url  + "' successfully revalidated and served from the indexedDB cache");
+              log("'" + cache.metaData.url  + "' successfully revalidated and served from the browser cache");
             });
 
             return readBodyWithProgress(cache.response, init.onProgress, init.enableStreamingDownload);
@@ -1119,14 +1163,59 @@ Module.UnityCache = function () {
         return fetchAndStoreInCache(resource, init);
       }
     }).catch(function (error) {
-      // Fallback to regular fetch if and IndexDB error occurs
-      log("Failed to load '" + cache.metaData.url  + "' from indexedDB cache due to the error: " + error);
+      // Fallback to regular fetch if an error occurs
+      log("Failed to load '" + cache.metaData.url  + "' from browser cache due to the error: " + error);
       return fetchWithProgress(resource, init);
     });
   }
 
   return cachedFetch;
 }();
+
+  var decompressors = {
+    gzip: {
+      hasUnityMarker: function (data) {
+        var commentOffset = 10, expectedComment = "UnityWeb Compressed Content (gzip)";
+        if (commentOffset > data.length || data[0] != 0x1F || data[1] != 0x8B)
+          return false;
+        var flags = data[3];
+        if (flags & 0x04) {
+          if (commentOffset + 2 > data.length)
+            return false;
+          commentOffset += 2 + data[commentOffset] + (data[commentOffset + 1] << 8);
+          if (commentOffset > data.length)
+            return false;
+        }
+        if (flags & 0x08) {
+          while (commentOffset < data.length && data[commentOffset])
+            commentOffset++;
+          if (commentOffset + 1 > data.length)
+            return false;
+          commentOffset++;
+        }
+        return (flags & 0x10) && String.fromCharCode.apply(null, data.subarray(commentOffset, commentOffset + expectedComment.length + 1)) == expectedComment + "\0";
+      },
+    },
+    br: {
+      hasUnityMarker: function (data) {
+        var expectedComment = "UnityWeb Compressed Content (brotli)";
+        if (!data.length)
+          return false;
+        var WBITS_length = (data[0] & 0x01) ? (data[0] & 0x0E) ? 4 : 7 : 1,
+            WBITS = data[0] & ((1 << WBITS_length) - 1),
+            MSKIPBYTES = 1 + ((Math.log(expectedComment.length - 1) / Math.log(2)) >> 3);
+            commentOffset = (WBITS_length + 1 + 2 + 1 + 2 + (MSKIPBYTES << 3) + 7) >> 3;
+        if (WBITS == 0x11 || commentOffset > data.length)
+          return false;
+        var expectedCommentPrefix = WBITS + (((3 << 1) + (MSKIPBYTES << 4) + ((expectedComment.length - 1) << 6)) << WBITS_length);
+        for (var i = 0; i < commentOffset; i++, expectedCommentPrefix >>>= 8) {
+          if (data[i] != (expectedCommentPrefix & 0xFF))
+            return false;
+        }
+        return String.fromCharCode.apply(null, data.subarray(commentOffset, commentOffset + expectedComment.length)) == expectedComment;
+      },
+    },
+  };
 
 
   function downloadBinary(urlId) {
@@ -1149,9 +1238,40 @@ Module.UnityCache = function () {
       });
 
       return request.then(function (response) {
+        // At this point the browser should have decompressed the gzip/brotli-compressed content,
+        // but that relies on the web server having been properly configured with Content-Encoding: gzip/br flag.
+        // Verify that browser did in fact decompress the content.
+        var compression;
+        if (decompressors.gzip.hasUnityMarker(response.parsedBody)) compression = ['gzip', 'gzip'];
+        if (decompressors.br.hasUnityMarker(response.parsedBody)) compression = ['brotli', 'br'];
+        if (compression) {
+          var type = response.headers.get('Content-Type');
+          var encoding = response.headers.get('Content-Encoding');
+          var compressedLength = response.headers.get('Content-Length'); // Content-Length, if present, specifies the byte size of the downloaded file when it was still compressed
+
+          var browserDidDecompress = (compressedLength > 0 && response.parsedBody.length != compressedLength);
+          var browserDidNotDecompress = (compressedLength > 0 && response.parsedBody.length == compressedLength);
+
+          if (encoding != compression[1]) showBanner('Failed to parse binary data file ' + url + ' (with "Content-Type: ' + type + '"), because it is still ' + compression[0] + '-compressed. It should have been uncompressed by the browser, but it was unable to do so since the web server provided the compressed content without specifying the HTTP Response Header "Content-Encoding: ' + compression[1] + '" that would have informed the browser that decompression is needed. Please verify your web server hosting configuration to add the missing "Content-Encoding: ' + compression[1] + '" HTTP Response Header.', 'error');
+          else if (browserDidDecompress) {
+            showBanner("Web server configuration error: it looks like the web server has been misconfigured to double-compress the data file " + url + "! That is, it looks like the web browser has decompressed the file, but it is still in compressed form, suggesting that an already compressed file was compressed a second time. (Content-Length: " + compressedLength + ', obtained length: ' + response.parsedBody.length + ')', 'error');
+          } else if (browserDidNotDecompress) {
+            var isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+            if (isSafari && encoding == 'gzip' && type == 'application/octet-stream')
+              showBanner('Unable to load content due to Apple Safari bug https://bugs.webkit.org/show_bug.cgi?id=247421 . To work around this issue, please reconfigure your web server to serve ' + url + ' with Content-Type: application/gzip instead of Content-Type: application/octet-stream', 'error');
+            else
+              showBanner('Malformed binary data? Received compressed data file ' + url + ', with "Content-Type: ' + type + '", "Content-Encoding: ' + compression[1] + '", "Content-Length: ' + compressedLength + '", which the web browser should have decompressed, but it seemingly did not (received file size is the same as compressed file size was). Double check that the integrity of the file is intact.', 'error');
+          } else {
+            showBanner('Malformed binary data URL ' + url + '. No "Content-Length" HTTP Response header present. Check browser console for more information.', 'error');
+          }
+          console.error('Malformed data? Downloaded binary data file ' + url + ' (ArrayBuffer size: ' + response.parsedBody.length + ') and browser should have decompressed it, but it might have not. Dumping raw HTTP Response Headers if it might help debug:');
+          response.headers.forEach(function(value, key) {
+            console.error(key + ': ' + value);
+          });
+        }
         return response.parsedBody;
       }).catch(function (e) {
-        var error = 'Failed to download file ' + Module[urlId];
+        var error = 'Failed to download file ' + url;
         if (location.protocol == 'file:') {
           showBanner(error + '. Loading web pages via a file:// URL without a web server is not supported by this browser. Please use a local development web server to host Unity content, or use the Unity Build and Run option.', 'error');
         } else {
@@ -1213,32 +1333,69 @@ Module.UnityCache = function () {
       });
   }
 
+  // WebGPU is only available if both navigator.gpu exists,
+  // and if requestAdapter returns a non-null adapter.
+  function checkForWebGPU() {
+    return new Promise(function (resolve, reject) {
+      if (!navigator.gpu) {
+        resolve(false);
+        return;
+      }
+      navigator.gpu.requestAdapter().then(function (adapter) {
+        Module.SystemInfo.hasWebGPU = !!adapter;
+        resolve(Module.SystemInfo.hasWebGPU);
+      });
+    });
+  }
+
   function loadBuild() {
+    var codeDownloadTimeStartup = performance.now();
     downloadFramework().then(function (unityFramework) {
+      Module.webAssemblyTimeStart = performance.now();
       unityFramework(Module);
+      Module.codeDownloadTimeEnd = performance.now() - codeDownloadTimeStartup;
     });
 
+    var dataUrlLoadStartTime = performance.now();
     var dataPromise = downloadBinary("dataUrl");
     Module.preRun.push(function () {
       Module.addRunDependency("dataUrl");
       dataPromise.then(function (data) {
-        var view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        var textDecoder = new TextDecoder('utf-8');
         var pos = 0;
+        // Reads an unaligned u32 from a given ArrayBuffer.
+        function readU32() {
+          var u32 = (data[pos] | (data[pos+1] << 8) | (data[pos+2]) << 16 | (data[pos+3] << 24)) >>> 0;
+          pos += 4;
+          return u32;
+        }
+        function fail(reason) {
+          if (decompressors.gzip.hasUnityMarker(data)) throw reason + '. Failed to parse binary data file, because it is still gzip-compressed and should have been uncompressed by the browser. Web server has likely provided gzip-compressed data without specifying the HTTP Response Header "Content-Encoding: gzip" with it to instruct the browser to decompress it. Please verify your web server hosting configuration.';
+          if (decompressors.br.hasUnityMarker(data)) throw reason + '. Failed to parse binary data file, because it is still brotli-compressed and should have been uncompressed by the browser. Web server has likely provided brotli-compressed data without specifying the HTTP Response Header "Content-Encoding: br" with it to instruct the browser to decompress it. Please verify your web server hosting configuration.';
+          throw reason;
+        }
         var prefix = "UnityWebData1.0\0";
-        if (!String.fromCharCode.apply(null, data.subarray(pos, pos + prefix.length)) == prefix)
-          throw "unknown data format";
+        var id = textDecoder.decode(data.subarray(0, prefix.length));
+        if (id != prefix) fail('Unknown data format (id="' + id + '")');
         pos += prefix.length;
-        var headerSize = view.getUint32(pos, true); pos += 4;
+        var headerSize = readU32();
+        if (pos + headerSize > data.length) fail('Invalid binary data file header! (pos=' + pos + ', headerSize=' + headerSize + ', file length=' + data.length + ')');
         while (pos < headerSize) {
-          var offset = view.getUint32(pos, true); pos += 4;
-          var size = view.getUint32(pos, true); pos += 4;
-          var pathLength = view.getUint32(pos, true); pos += 4;
-          var path = String.fromCharCode.apply(null, data.subarray(pos, pos + pathLength)); pos += pathLength;
+          var offset = readU32();
+          var size = readU32();
+          if (offset + size > data.length) fail('Invalid binary data file size! (offset=' + offset + ', size=' + size + ', file length=' + data.length + ')');
+          var pathLength = readU32();
+          if (pos + pathLength > data.length) fail('Invalid binary data file path name! (pos=' + pos + ', length=' + pathLength + ', file length=' + data.length + ')');
+          var path = textDecoder.decode(data.subarray(pos, pos + pathLength));
+          pos += pathLength;
+          // Create the full path leading up to the target filename ("mkdir -d" behavior)
           for (var folder = 0, folderNext = path.indexOf("/", folder) + 1 ; folderNext > 0; folder = folderNext, folderNext = path.indexOf("/", folder) + 1)
             Module.FS_createPath(path.substring(0, folder), path.substring(folder, folderNext - 1), true, true);
+          // Create the file itself
           Module.FS_createDataFile(path, null, data.subarray(offset, offset + size), true, true, true);
         }
         Module.removeRunDependency("dataUrl");
+        Module.dataUrlLoadEndTime = performance.now() - dataUrlLoadStartTime;
       });
     });
   }
@@ -1262,10 +1419,17 @@ Module.UnityCache = function () {
       onProgress(0);
       Module.postRun.push(function () {
         onProgress(1);
-        delete Module.startupErrorHandler;
-        resolve(unityInstance);
+        Module.WebPlayer.WaitForInitialization().then(function () {
+          delete Module.startupErrorHandler;
+          resolve(unityInstance);
+          Module.pageStartupTime = performance.now();
+        });
       });
-      loadBuild();
+      // Checking for WebGPU availability is asynchronous, so wait until
+      // it has finished checking before loading the build.
+      checkForWebGPU().then(function () {
+        loadBuild();
+      });
     }
   });
 }
