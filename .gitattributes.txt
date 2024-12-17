@@ -1,7 +1,0 @@
-*.gz binary
-*.wasm application/wasm
-*.data.gz binary
-*.wasm.gz binary
-*.js text
-*.html text
-*.css text
